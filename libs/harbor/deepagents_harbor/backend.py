@@ -1,6 +1,8 @@
-"""Implement harbor backend."""
+"""Harbor sandbox backend for executing commands in Harbor environments."""
 
+import asyncio
 import base64
+import json
 import shlex
 
 from deepagents.backends.protocol import (
@@ -13,9 +15,33 @@ from deepagents.backends.protocol import (
 )
 from harbor.environments.base import BaseEnvironment
 
+_SYNC_NOT_SUPPORTED = "This backend only supports async execution. Use the async variant instead."
+
+# Shell exit codes used by the aedit command script
+_EXIT_NOT_FOUND = 1
+_EXIT_MULTIPLE_MATCHES = 2
+_EXIT_FILE_MISSING = 3
+_EXIT_DECODE_FAILED = 4
+
+DEFAULT_COMMAND_TIMEOUT_SEC = 300
+"""Default per-command timeout (5 minutes) to prevent stuck command hangs."""
+
+_PIPE_FIELD_COUNT = 2
+"""Expected number of pipe-separated fields in `ls`/`glob` output."""
+
+_GREP_FIELD_COUNT = 3
+"""Minimum number of colon-separated fields in `grep` output."""
+
+_COMMAND_PREVIEW_CHAR_LIMIT = 200
+"""Maximum chars included in timeout error command previews."""
+
 
 class HarborSandbox(SandboxBackendProtocol):
-    """A sandbox implementation without assuming that python3 is available."""
+    """A sandbox implementation using shell commands.
+
+    Note: The edit operation requires python3 for JSON parsing. Other operations
+    (read, write, ls, grep, glob) use only standard shell utilities.
+    """
 
     def __init__(self, environment: BaseEnvironment) -> None:
         """Initialize HarborSandbox with the given environment."""
@@ -24,15 +50,46 @@ class HarborSandbox(SandboxBackendProtocol):
     async def aexecute(
         self,
         command: str,
+        *,
+        timeout: int | None = None,  # noqa: ASYNC109  # Timeout parameter is forwarded to environment exec, not used as asyncio timeout
     ) -> ExecuteResponse:
-        """Execute a bash command in the task environment."""
-        result = await self.environment.exec(command)
+        """Execute a bash command in the task environment.
+
+        Args:
+            command: Shell command string to execute.
+            timeout: Maximum time in seconds to wait for the command to complete.
+
+                If None, uses the environment's default timeout.
+        """
+        timeout_sec = timeout if timeout is not None else DEFAULT_COMMAND_TIMEOUT_SEC
+        try:
+            if timeout_sec > 0:
+                result = await asyncio.wait_for(
+                    self.environment.exec(command),
+                    timeout=timeout_sec,
+                )
+            else:
+                result = await self.environment.exec(command)
+        except TimeoutError:
+            return ExecuteResponse(
+                output=f"ERROR: Command timed out after {timeout_sec} seconds.\n"
+                f"Command: {command[:_COMMAND_PREVIEW_CHAR_LIMIT]}"
+                f"{'...' if len(command) > _COMMAND_PREVIEW_CHAR_LIMIT else ''}\n\n"
+                f"SUGGESTION: This command is taking too long. Consider:\n"
+                f"- Breaking it into smaller steps\n"
+                f"- Using a shorter timeout with the timeout_sec parameter\n"
+                f"- For package installs: use --no-install-recommends ...\n"
+                f"- For long builds: run in background with nohup ...",
+                exit_code=124,
+                truncated=False,
+            )
 
         # These errors appear in harbor environments when running bash commands
         # in non-interactive/non-TTY contexts. They're harmless artifacts.
         # Filter them from both stdout and stderr, then collect them to show in stderr.
         error_messages = [
             "bash: cannot set terminal process group (-1): Inappropriate ioctl for device",
+            "bash: cannot set terminal process group (1): Inappropriate ioctl for device",
             "bash: no job control in this shell",
             "bash: initialize_job_control: no job control in background: Bad file descriptor",
         ]
@@ -70,9 +127,11 @@ class HarborSandbox(SandboxBackendProtocol):
     def execute(
         self,
         command: str,
+        *,
+        timeout: int | None = None,
     ) -> ExecuteResponse:
         """Execute a bash command in the task environment."""
-        raise NotImplementedError("This backend only supports async execution")
+        raise NotImplementedError(_SYNC_NOT_SUPPORTED)
 
     @property
     def id(self) -> str:
@@ -121,7 +180,7 @@ awk -v offset={offset} -v limit={limit} '
         limit: int = 2000,
     ) -> str:
         """Read file content with line numbers using shell commands."""
-        raise NotImplementedError("Use aread instead")
+        raise NotImplementedError(_SYNC_NOT_SUPPORTED)
 
     async def awrite(
         self,
@@ -133,14 +192,23 @@ awk -v offset={offset} -v limit={limit} '
         content_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
         safe_path = shlex.quote(file_path)
 
+        # Use heredoc to pass content via stdin to avoid ARG_MAX limits on large files.
+        # ARG_MAX limits the total size of command-line arguments.
+        # Heredocs bypass this by passing data through stdin rather than as arguments.
         cmd = f"""
 if [ -e {safe_path} ]; then
-    echo "Error: File '{file_path}' already exists" >&2
+    echo "Error: File '"{safe_path}"' already exists" >&2
     exit 1
 fi
 parent_dir=$(dirname {safe_path})
 mkdir -p "$parent_dir" 2>/dev/null
-echo '{content_b64}' | base64 -d > {safe_path}
+if ! base64 -d > {safe_path} <<'__DEEPAGENTS_EOF__'
+{content_b64}
+__DEEPAGENTS_EOF__
+then
+    echo "Error: Failed to decode content for file '"{safe_path}"' " >&2
+    exit 1
+fi
 """
         result = await self.aexecute(cmd)
 
@@ -156,7 +224,7 @@ echo '{content_b64}' | base64 -d > {safe_path}
         content: str,
     ) -> WriteResult:
         """Create a new file using shell commands."""
-        raise NotImplementedError("Use awrite instead")
+        raise NotImplementedError(_SYNC_NOT_SUPPORTED)
 
     async def aedit(
         self,
@@ -166,54 +234,87 @@ echo '{content_b64}' | base64 -d > {safe_path}
         replace_all: bool = False,
     ) -> EditResult:
         """Edit a file by replacing string occurrences using shell commands."""
-        # Encode strings as base64 to avoid escaping issues
-        old_b64 = base64.b64encode(old_string.encode("utf-8")).decode("ascii")
-        new_b64 = base64.b64encode(new_string.encode("utf-8")).decode("ascii")
+        # Create JSON payload with old and new strings, then base64 encode
+        payload = json.dumps({"old": old_string, "new": new_string})
+        payload_b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
         safe_path = shlex.quote(file_path)
         replace_all_str = "true" if replace_all else "false"
 
-        # Use a shell script with perl for reliable string replacement
+        # Use heredoc to pass old/new strings via stdin to avoid ARG_MAX limits.
+        # ARG_MAX limits the total size of command-line arguments.
+        # Format: base64-encoded JSON with {{"old": str, "new": str}}.
+        # The heredoc feeds into the brace group { ... } which reads and processes stdin.
         cmd = f"""
 if [ ! -f {safe_path} ]; then
     exit 3
 fi
 
-old=$(echo '{old_b64}' | base64 -d)
-new=$(echo '{new_b64}' | base64 -d)
+{{
+    # Read entire heredoc content using cat (read only gets first line)
+    payload_b64=$(cat)
+    if [ -z "$payload_b64" ]; then
+        echo "Error: No payload received for edit operation" >&2
+        exit 4
+    fi
 
-# Count occurrences using grep -F (fixed strings)
-count=$(grep -o -F "$old" {safe_path} | wc -l)
+    # Decode base64 payload
+    payload=$(echo "$payload_b64" | base64 -d) || {{
+        echo "Error: Failed to decode payload" >&2
+        exit 4
+    }}
 
-if [ "$count" -eq 0 ]; then
-    exit 1
-elif [ "$count" -gt 1 ] && [ "{replace_all_str}" = "false" ]; then
-    exit 2
-fi
+    # Extract old and new strings from JSON using python3
+    old=$(echo "$payload" | python3 -c "import sys, json; print(json.load(sys.stdin)['old'], end='')") || {{
+        echo "Error: Failed to parse JSON payload" >&2
+        exit 4
+    }}
+    new=$(echo "$payload" | python3 -c "import sys, json; print(json.load(sys.stdin)['new'], end='')") || {{
+        echo "Error: Failed to parse JSON payload" >&2
+        exit 4
+    }}
 
-# Use perl for reliable string replacement (handles special chars)
-if [ "{replace_all_str}" = "true" ]; then
-    perl -i -pe 's/\\Q'"$old"'\\E/'"$new"'/g' {safe_path}
-else
-    perl -i -pe 's/\\Q'"$old"'\\E/'"$new"'/' {safe_path}
-fi
+    # Count occurrences using grep -F (fixed strings)
+    count=$(grep -o -F "$old" {safe_path} | wc -l)
 
-echo "$count"
+    if [ "$count" -eq 0 ]; then
+        exit 1
+    elif [ "$count" -gt 1 ] && [ "{replace_all_str}" = "false" ]; then
+        exit 2
+    fi
+
+    # Use perl for reliable string replacement (handles special chars).
+    # Note: \\Q...\\E escapes the search pattern. The replacement string is not
+    # escaped, so Perl special sequences (\\U, $1, etc.) in new will be interpreted.
+    if [ "{replace_all_str}" = "true" ]; then
+        perl -i -pe 's/\\Q'"$old"'\\E/'"$new"'/g' {safe_path}
+    else
+        perl -i -pe 's/\\Q'"$old"'\\E/'"$new"'/' {safe_path}
+    fi
+
+    echo "$count"
+}} <<'__DEEPAGENTS_EOF__'
+{payload_b64}
+__DEEPAGENTS_EOF__
 """
         result = await self.aexecute(cmd)
 
         exit_code = result.exit_code
         output = result.output.strip()
 
-        if exit_code == 1:
+        if exit_code == _EXIT_NOT_FOUND:
             return EditResult(error=f"Error: String not found in file: '{old_string}'")
-        if exit_code == 2:
+        if exit_code == _EXIT_MULTIPLE_MATCHES:
             return EditResult(
                 error=f"Error: String '{old_string}' appears multiple times. Use replace_all=True to replace all occurrences."
             )
-        if exit_code == 3:
+        if exit_code == _EXIT_FILE_MISSING:
             return EditResult(error=f"Error: File '{file_path}' not found")
+        if exit_code == _EXIT_DECODE_FAILED:
+            return EditResult(error=f"Error: Failed to decode edit payload: {output}")
         if exit_code != 0:
-            return EditResult(error=f"Error editing file: {output}")
+            return EditResult(
+                error=f"Error editing file (exit code {exit_code}): {output or 'Unknown error'}"
+            )
 
         try:
             count = int(output.split("\n")[0])
@@ -230,7 +331,7 @@ echo "$count"
         replace_all: bool = False,
     ) -> EditResult:
         """Edit a file by replacing string occurrences using shell commands."""
-        raise NotImplementedError("Use aedit instead")
+        raise NotImplementedError(_SYNC_NOT_SUPPORTED)
 
     async def als_info(self, path: str) -> list[FileInfo]:
         """List directory contents with metadata using shell commands."""
@@ -261,14 +362,14 @@ done
             if not line:
                 continue
             parts = line.split("|")
-            if len(parts) == 2:
+            if len(parts) == _PIPE_FIELD_COUNT:
                 file_infos.append({"path": parts[0], "is_dir": parts[1] == "true"})
 
         return file_infos
 
     def ls_info(self, path: str) -> list[FileInfo]:
         """List directory contents with metadata using shell commands."""
-        raise NotImplementedError("Use als_info instead")
+        raise NotImplementedError(_SYNC_NOT_SUPPORTED)
 
     async def agrep_raw(
         self,
@@ -302,7 +403,7 @@ done
         for line in output.split("\n"):
             # Format is: path:line_number:text
             parts = line.split(":", 2)
-            if len(parts) >= 3:
+            if len(parts) >= _GREP_FIELD_COUNT:
                 try:
                     matches.append(
                         {
@@ -323,7 +424,7 @@ done
         glob: str | None = None,
     ) -> list[GrepMatch] | str:
         """Search for pattern in files using grep."""
-        raise NotImplementedError("Use agrep_raw instead")
+        raise NotImplementedError(_SYNC_NOT_SUPPORTED)
 
     async def aglob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
         """Find files matching glob pattern using shell commands.
@@ -362,7 +463,7 @@ done
             if not line:
                 continue
             parts = line.split("|")
-            if len(parts) == 2:
+            if len(parts) == _PIPE_FIELD_COUNT:
                 file_infos.append(
                     {
                         "path": parts[0],
@@ -374,4 +475,4 @@ done
 
     def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
         """Find files matching glob pattern using shell commands."""
-        raise NotImplementedError("Use aglob_info instead")
+        raise NotImplementedError(_SYNC_NOT_SUPPORTED)

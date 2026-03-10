@@ -1,9 +1,17 @@
 """StoreBackend: Adapter for LangGraph's BaseStore (persistent, cross-thread)."""
 
-from typing import Any
+import re
+import warnings
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Generic
 
 from langgraph.config import get_config
+
+if TYPE_CHECKING:
+    from langchain.tools import ToolRuntime
 from langgraph.store.base import BaseStore, Item
+from langgraph.typing import ContextT, StateT
 
 from deepagents.backends.protocol import (
     BackendProtocol,
@@ -24,6 +32,67 @@ from deepagents.backends.utils import (
     update_file_data,
 )
 
+if TYPE_CHECKING:
+    from langchain.tools import ToolRuntime
+    from langgraph.runtime import Runtime
+
+
+@dataclass
+class BackendContext(Generic[StateT, ContextT]):
+    """Context passed to namespace factory functions."""
+
+    state: StateT
+    runtime: "Runtime[ContextT]"
+
+
+# Type alias for namespace factory functions
+NamespaceFactory = Callable[[BackendContext[Any, Any]], tuple[str, ...]]
+
+# Allowed characters in namespace components: alphanumeric, plus characters
+# common in user IDs (hyphen, underscore, dot, @, +, colon, tilde).
+_NAMESPACE_COMPONENT_RE = re.compile(r"^[A-Za-z0-9\-_.@+:~]+$")
+
+
+def _validate_namespace(namespace: tuple[str, ...]) -> tuple[str, ...]:
+    """Validate a namespace tuple returned by a NamespaceFactory.
+
+    Each component must be a non-empty string containing only safe characters:
+    alphanumeric (a-z, A-Z, 0-9), hyphen (-), underscore (_), dot (.),
+    at sign (@), plus (+), colon (:), and tilde (~).
+
+    Characters like ``*``, ``?``, ``[``, ``]``, ``{``, ``}``, etc. are
+    rejected to prevent wildcard or glob injection in store lookups.
+
+    Args:
+        namespace: The namespace tuple to validate.
+
+    Returns:
+        The validated namespace tuple (unchanged).
+
+    Raises:
+        ValueError: If the namespace is empty, contains non-string elements,
+            empty strings, or strings with disallowed characters.
+    """
+    if not namespace:
+        msg = "Namespace tuple must not be empty."
+        raise ValueError(msg)
+
+    for i, component in enumerate(namespace):
+        if not isinstance(component, str):
+            msg = f"Namespace component at index {i} must be a string, got {type(component).__name__}."
+            raise TypeError(msg)
+        if not component:
+            msg = f"Namespace component at index {i} must not be empty."
+            raise ValueError(msg)
+        if not _NAMESPACE_COMPONENT_RE.match(component):
+            msg = (
+                f"Namespace component at index {i} contains disallowed characters: {component!r}. "
+                f"Only alphanumeric characters, hyphens, underscores, dots, @, +, colons, and tildes are allowed."
+            )
+            raise ValueError(msg)
+
+    return namespace
+
 
 class StoreBackend(BackendProtocol):
     """Backend that stores files in LangGraph's BaseStore (persistent).
@@ -34,13 +103,27 @@ class StoreBackend(BackendProtocol):
     The namespace can include an optional assistant_id for multi-agent isolation.
     """
 
-    def __init__(self, runtime: "ToolRuntime"):
+    def __init__(self, runtime: "ToolRuntime", *, namespace: NamespaceFactory | None = None) -> None:
         """Initialize StoreBackend with runtime.
 
         Args:
             runtime: The ToolRuntime instance providing store access and configuration.
+            namespace: Optional callable that takes a BackendContext and returns
+                a namespace tuple. This provides full flexibility for namespace resolution.
+                We forbid * which is a wild card for now.
+                If None, uses legacy assistant_id detection from metadata (deprecated).
+
+                .. note::
+                    This parameter will be **required** in version 0.5.0.
+
+                .. warning::
+                    This API is subject to change in a minor version.
+
+        Example:
+                    namespace=lambda ctx: ("filesystem", ctx.runtime.context.user_id)
         """
         self.runtime = runtime
+        self._namespace = namespace
 
     def _get_store(self) -> BaseStore:
         """Get the store instance.
@@ -60,6 +143,19 @@ class StoreBackend(BackendProtocol):
     def _get_namespace(self) -> tuple[str, ...]:
         """Get the namespace for store operations.
 
+        If namespace was provided at init, calls it with a BackendContext.
+        Otherwise, uses legacy assistant_id detection from metadata (deprecated).
+        """
+        if self._namespace is not None:
+            state = getattr(self.runtime, "state", None)
+            ctx = BackendContext(state=state, runtime=self.runtime)  # ty: ignore[invalid-argument-type]
+            return _validate_namespace(self._namespace(ctx))
+
+        return self._get_namespace_legacy()
+
+    def _get_namespace_legacy(self) -> tuple[str, ...]:
+        """Legacy namespace resolution: check metadata for assistant_id.
+
         Preference order:
         1) Use `self.runtime.config` if present (tests pass this explicitly).
         2) Fallback to `langgraph.config.get_config()` if available.
@@ -67,7 +163,15 @@ class StoreBackend(BackendProtocol):
 
         If an assistant_id is available in the config metadata, return
         (assistant_id, "filesystem") to provide per-assistant isolation.
+
+        .. deprecated::
+            Pass `namespace` to StoreBackend instead of relying on legacy detection.
         """
+        warnings.warn(
+            "StoreBackend without explicit `namespace` is deprecated. Pass `namespace=lambda ctx: (...)` to StoreBackend.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
         namespace = "filesystem"
 
         # Prefer the runtime-provided config when present
@@ -82,12 +186,12 @@ class StoreBackend(BackendProtocol):
         # called outside of a runnable context
         try:
             cfg = get_config()
-        except Exception:
+        except Exception:  # noqa: BLE001  # Intentional for resilient config fallback
             return (namespace,)
 
         try:
-            assistant_id = cfg.get("metadata", {}).get("assistant_id")  # type: ignore[assignment]
-        except Exception:
+            assistant_id = cfg.get("metadata", {}).get("assistant_id")
+        except Exception:  # noqa: BLE001  # Intentional for resilient config fallback
             assistant_id = None
 
         if assistant_id:
@@ -142,7 +246,7 @@ class StoreBackend(BackendProtocol):
         namespace: tuple[str, ...],
         *,
         query: str | None = None,
-        filter: dict[str, Any] | None = None,
+        filter: dict[str, Any] | None = None,  # noqa: A002  # Matches LangGraph BaseStore.search() API
         page_size: int = 100,
     ) -> list[Item]:
         """Search store with automatic pagination to retrieve all results.
@@ -236,15 +340,7 @@ class StoreBackend(BackendProtocol):
             )
 
         # Add directories to the results
-        for subdir in sorted(subdirs):
-            infos.append(
-                {
-                    "path": subdir,
-                    "is_dir": True,
-                    "size": 0,
-                    "modified_at": "",
-                }
-            )
+        infos.extend(FileInfo(path=subdir, is_dir=True, size=0, modified_at="") for subdir in sorted(subdirs))
 
         infos.sort(key=lambda x: x.get("path", ""))
         return infos
@@ -279,12 +375,37 @@ class StoreBackend(BackendProtocol):
 
         return format_read_response(file_data, offset, limit)
 
+    async def aread(
+        self,
+        file_path: str,
+        offset: int = 0,
+        limit: int = 2000,
+    ) -> str:
+        """Async version of read using native store async methods.
+
+        This avoids sync calls in async context by using store.aget directly.
+        """
+        store = self._get_store()
+        namespace = self._get_namespace()
+        item: Item | None = await store.aget(namespace, file_path)
+
+        if item is None:
+            return f"Error: File '{file_path}' not found"
+
+        try:
+            file_data = self._convert_store_item_to_file_data(item)
+        except ValueError as e:
+            return f"Error: {e}"
+
+        return format_read_response(file_data, offset, limit)
+
     def write(
         self,
         file_path: str,
         content: str,
     ) -> WriteResult:
         """Create a new file with content.
+
         Returns WriteResult. External storage sets files_update=None.
         """
         store = self._get_store()
@@ -301,14 +422,38 @@ class StoreBackend(BackendProtocol):
         store.put(namespace, file_path, store_value)
         return WriteResult(path=file_path, files_update=None)
 
+    async def awrite(
+        self,
+        file_path: str,
+        content: str,
+    ) -> WriteResult:
+        """Async version of write using native store async methods.
+
+        This avoids sync calls in async context by using store.aget/aput directly.
+        """
+        store = self._get_store()
+        namespace = self._get_namespace()
+
+        # Check if file exists using async method
+        existing = await store.aget(namespace, file_path)
+        if existing is not None:
+            return WriteResult(error=f"Cannot write to {file_path} because it already exists. Read and then make an edit, or write to a new path.")
+
+        # Create new file using async method
+        file_data = create_file_data(content)
+        store_value = self._convert_file_data_to_store_value(file_data)
+        await store.aput(namespace, file_path, store_value)
+        return WriteResult(path=file_path, files_update=None)
+
     def edit(
         self,
         file_path: str,
         old_string: str,
         new_string: str,
-        replace_all: bool = False,
+        replace_all: bool = False,  # noqa: FBT001, FBT002
     ) -> EditResult:
         """Edit a file by replacing string occurrences.
+
         Returns EditResult. External storage sets files_update=None.
         """
         store = self._get_store()
@@ -338,14 +483,53 @@ class StoreBackend(BackendProtocol):
         store.put(namespace, file_path, store_value)
         return EditResult(path=file_path, files_update=None, occurrences=int(occurrences))
 
+    async def aedit(
+        self,
+        file_path: str,
+        old_string: str,
+        new_string: str,
+        replace_all: bool = False,  # noqa: FBT001, FBT002
+    ) -> EditResult:
+        """Async version of edit using native store async methods.
+
+        This avoids sync calls in async context by using store.aget/aput directly.
+        """
+        store = self._get_store()
+        namespace = self._get_namespace()
+
+        # Get existing file using async method
+        item = await store.aget(namespace, file_path)
+        if item is None:
+            return EditResult(error=f"Error: File '{file_path}' not found")
+
+        try:
+            file_data = self._convert_store_item_to_file_data(item)
+        except ValueError as e:
+            return EditResult(error=f"Error: {e}")
+
+        content = file_data_to_string(file_data)
+        result = perform_string_replacement(content, old_string, new_string, replace_all)
+
+        if isinstance(result, str):
+            return EditResult(error=result)
+
+        new_content, occurrences = result
+        new_file_data = update_file_data(file_data, new_content)
+
+        # Update file in store using async method
+        store_value = self._convert_file_data_to_store_value(new_file_data)
+        await store.aput(namespace, file_path, store_value)
+        return EditResult(path=file_path, files_update=None, occurrences=int(occurrences))
+
     # Removed legacy grep() convenience to keep lean surface
 
     def grep_raw(
         self,
         pattern: str,
-        path: str = "/",
+        path: str | None = None,
         glob: str | None = None,
     ) -> list[GrepMatch] | str:
+        """Search store files for a literal text pattern."""
         store = self._get_store()
         namespace = self._get_namespace()
         items = self._search_store_paginated(store, namespace)
@@ -358,6 +542,7 @@ class StoreBackend(BackendProtocol):
         return grep_matches_from_files(files, pattern, path, glob)
 
     def glob_info(self, pattern: str, path: str = "/") -> list[FileInfo]:
+        """Find files matching a glob pattern in the store."""
         store = self._get_store()
         namespace = self._get_namespace()
         items = self._search_store_paginated(store, namespace)
